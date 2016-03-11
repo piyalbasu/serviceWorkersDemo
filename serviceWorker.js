@@ -1,0 +1,166 @@
+'use strict';
+
+var config = {
+	//update the version to force-grab all the resources
+  version: '4.5',
+  staticCacheItems: [
+    '/images/applause.gif',
+    '/scripts/app.js',
+    '/offline/',
+    '/'
+  ],
+  cachePathPattern: /^\/(?:(20[0-9]{2}|about|blog|css|images|js)\/(.+)?)?$/,
+  offlineImage: '<svg role="img" aria-labelledby="offline-title"'
+    + ' viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">'
+    + '<title id="offline-title">Offline</title>'
+    + '<g fill="none" fill-rule="evenodd"><path fill="#D8D8D8" d="M0 0h400v300H0z"/>'
+    + '<text fill="#9B9B9B" font-family="Times New Roman,Times,serif" font-size="72" font-weight="bold">'
+    + '<tspan x="93" y="172">offline</tspan></text></g></svg>',
+  offlinePage: '/offline/'
+};
+
+	
+function cacheName (key, opts) {
+  return `${opts.version}-${key}`;
+}
+
+function addToCache (cacheKey, request, response) {
+
+  if (response.ok && response.url.indexOf('online') === -1) {
+  	//if response is 200 (don't need to cache 404's, 500s, etc)
+
+    var copy = response.clone();
+    //need to clone bc a response can only be used once bc it's a stream
+    caches.open(cacheKey).then( cache => {
+      cache.put(request, copy);
+    });
+  }
+  return response;
+}
+
+function fetchFromCache (event) {
+  return caches.match(event.request).then(response => {
+  	//check the cache for the request in question
+    if (!response) {
+      throw Error(`${event.request.url} not found in cache`);
+    }
+    return response;
+  });
+}
+
+function offlineResponse (resourceType, opts) {
+	//nothing huh? must be offline
+  if (resourceType === 'image') {
+  	//serve up an offline img
+    return new Response(opts.offlineImage,
+      { headers: { 'Content-Type': 'image/svg+xml' } }
+    );
+  } else if (resourceType === 'content') {
+  	//or an offline page
+    return caches.match(opts.offlinePage);
+  }
+  return undefined;
+}
+
+self.addEventListener('install', event => {
+  // Do install stuff
+    console.log('installing');
+    function onInstall (events, opts) {
+    	var cacheKey = cacheName('static', opts);
+
+    	//if any of this fails, the install won't happen
+
+    	return caches.open('static')
+      .then(cache => cache.addAll(opts.staticCacheItems)
+    	);
+  	}
+
+  event.waitUntil(
+    onInstall(event, config)
+    	//skipWaiting forces Activation. Without this, this would wait til old service workers were stopped before activating the new one
+     .then( () => self.skipWaiting() )
+  );
+
+});
+
+self.addEventListener('activate', event => {
+  console.log('activate');
+  function onActivate (event, opts) {
+    return caches.keys()
+    .then(cacheKeys => {
+      var oldCacheKeys = cacheKeys.filter(key =>
+        key.indexOf(opts.version) !== 0
+      );
+      var deletePromises = oldCacheKeys.map(oldKey => caches.delete(oldKey));
+      return Promise.all(deletePromises);
+    });
+  }
+
+  event.waitUntil(
+    onActivate(event, config)
+    	//make it activate on any open pgs
+     .then( () => self.clients.claim() )
+  );
+});
+
+self.addEventListener('fetch', event => {
+
+  function shouldHandleFetch (event, opts) {
+    // Should we handle this fetch?
+    var request = event.request,
+		    url = new URL(request.url),
+		    criteria = {
+						matchesPathPattern: opts.cachePathPattern.test(url.pathname),
+				    isGETRequest: request.method === 'GET'
+			  };
+
+	  // Create a new array with just the keys from criteria that have
+	  // failing (i.e. false) values.
+	  var failingCriteria = Object.keys(criteria)
+	    .filter(criteriaKey => !criteria[criteriaKey]);
+
+	  // If that failing array has any length, one or more tests failed.
+	  return !failingCriteria.length;
+  }
+
+  function onFetch (event, opts) {
+  	// Let's do something when we fetch
+    var request = event.request;
+    var acceptHeader = request.headers.get('Accept');
+    var resourceType = 'static';
+    var cacheKey;
+
+    //figure out what assets we're getting here
+
+    if (acceptHeader.indexOf('text/html') !== -1) {
+      resourceType = 'content';
+    } else if (acceptHeader.indexOf('image') !== -1) {
+      resourceType = 'image';
+    }
+    cacheKey = resourceType;
+
+    if (resourceType === 'content') {
+    	// Use a network-first strategy. For things that change often (content, etc)
+      event.respondWith(
+        fetch(request)
+          .then(response => addToCache(cacheKey, request, response))
+          //did the fetch resolve? If not, get it from the cache
+          .catch(() => fetchFromCache(event))
+          //still nothing? offline response time
+          .catch(() => offlineResponse(resourceType, opts))
+      );
+    } else {
+	    // Use a cache-first strategy.
+      event.respondWith(
+        fetchFromCache(event)
+          .catch(() => fetch(request))
+            .then(response => addToCache(cacheKey, request, response))
+          .catch(() => offlineResponse(resourceType, opts))
+      );
+    }
+  }
+
+  if (shouldHandleFetch(event, config)) {
+    onFetch(event, config);
+  }
+});
